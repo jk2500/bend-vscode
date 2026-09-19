@@ -2,7 +2,7 @@
   "name": "bend2",
   "displayName": "Bend (2.0) \u2014 Language Server",
   "description": "Bend 2.0 language support powered by the real Bend checker: exact diagnostics, law/proof workflow states. LSP server + syntax.",
-  "version": "2.3.0",
+  "version": "2.3.1",
   "publisher": "jk2500",
   "license": "MIT",
   "icon": "icon.png",

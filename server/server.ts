@@ -27,17 +27,23 @@ function versCmp(a: string, b: string): number {
 }
 
 function findBendTs(): string | null {
+  const cands: string[] = [];
+  if (process.env.BEND_LSP_BEND_TS) cands.push(process.env.BEND_LSP_BEND_TS);
   const home = process.env.BEND_HOME || path.join(os.homedir(), ".bend");
-  const cur = path.join(home, "current", "bend2", "bend.ts");
-  if (fs.existsSync(cur)) return fs.realpathSync(cur);
-  const app = path.join(home, "app");
+  cands.push(path.join(home, "current", "bend2", "bend.ts")); // legacy layout
+  cands.push(path.join(home, "bend2", "bend.ts"));            // flat layout
+  const app = path.join(home, "app");                          // legacy versioned
   if (fs.existsSync(app)) {
     for (const ver of fs.readdirSync(app).filter((d) => /^\d/.test(d)).sort(versCmp).reverse()) {
       for (const hash of fs.readdirSync(path.join(app, ver))) {
-        const p = path.join(app, ver, hash, "bend2", "bend.ts");
-        if (fs.existsSync(p)) return p;
+        cands.push(path.join(app, ver, hash, "bend2", "bend.ts"));
       }
     }
+  }
+  // vendored copy (the 2.0.16+ installer ships a binary, no sources)
+  cands.push(path.join(import.meta.dirname, "deps", "bend2", "bend.ts"));
+  for (const c of cands) {
+    try { if (fs.existsSync(c)) return fs.realpathSync(c); } catch { /* next */ }
   }
   return null;
 }
@@ -1273,8 +1279,11 @@ peer.requestHandler = async (method: string, params: any) => {
       const file = uriFile(uri);
       if (!file) return null;
       if (at) {
+        const seen = new Set<string>();
         return ((cacheOf(uri)?.occ.get(file)) ?? projectOcc.get(file) ?? [])
           .filter((o) => o.cid === at.cid)
+          .filter((o) => { const id = o.line + ":" + o.c0 + ":" + o.c1;
+            if (seen.has(id)) return false; seen.add(id); return true; })
           .map((o) => ({ range: { start: { line: o.line, character: o.c0 }, end: { line: o.line, character: o.c1 } }, kind: 1 }));
       }
       // a local: highlight same-name locals within the enclosing def
@@ -1287,8 +1296,11 @@ peer.requestHandler = async (method: string, params: any) => {
       if (!decl) return null;
       const next = meta.decls.find((d) => d.line > decl.line);
       const endLine = next ? next.line : meta.text.split("\n").length;
+      const seenL = new Set<string>();
       return occs.filter((o) => (o.kind === "Var" || o.kind === "PVar" || o.kind === "binder")
         && o.k === loc.name && o.line >= decl.line && o.line < endLine)
+        .filter((o) => { const id = o.line + ":" + o.c0 + ":" + o.c1;
+          if (seenL.has(id)) return false; seenL.add(id); return true; })
         .map((o) => ({ range: { start: { line: o.line, character: o.c0 }, end: { line: o.line, character: o.c1 } }, kind: 1 }));
     }
     case "textDocument/prepareRename": {

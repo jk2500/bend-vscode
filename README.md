@@ -5,8 +5,12 @@ Language support for [Bend 2.0](https://bend-lang.com) — the parallel language
 ## How it works
 
 `server/server.ts` is a zero-dependency LSP server that imports the actual
-toolchain (`~/.bend/current/bend2/bend.ts` — the same code the `bend` CLI
-runs) and reports its structured results. Nothing about the language is
+checker (`bend.ts` — the same code the `bend` CLI runs) and reports its
+structured results. It prefers your installed toolchain's sources when
+available (`~/.bend/current/bend2/bend.ts`, `~/.bend/bend2/bend.ts`, or
+`BEND_LSP_BEND_TS`); since the 2.0.16 installer ships a compiled binary with
+no sources, a vendored copy of the official checker (github.com/bendlang/bend)
+ships inside the extension under `server/deps/bend2/`. Nothing about the language is
 reimplemented: parse, types, laws, holes and locations all come from Bend
 itself. The extension only spawns it with `bun` and maps results to squiggles.
 
