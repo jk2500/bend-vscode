@@ -6,6 +6,14 @@ Faithfully ported from the official `bend2/docs/bend.sublime-syntax` in the [Hig
 
 ## Features
 
+### Live checking (v1.1)
+- Runs the real Bend checker (`bend`) when you open or save a `.bend` file
+- Errors get red squiggles with the checker's own `expected / observed` message and location
+- Open laws show as an information marker: "N open claims (TODO)" - a workflow state, not an error
+- Status bar shows the file's state: All terms check / errors / open claims
+- Command: "Bend: check this file now"
+- Uses `-o <tmp>.c` so `main` never executes during checking; 15s timeout; no network
+
 - All Bend 2.0 keywords: `def`, `law`, `type`, `match`, `case`, `import`, `for`, `exs`, `where`, `do`, `is`, `@unsafe`
 - Law and proof support: `law`/`def` names highlighted, `{==}` proof token gets its own color, holes (`?name`) distinct
 - `Nat` literals (`3n`), use-counts (`&0`/`&1`/`&2`), numbers, strings, char literals

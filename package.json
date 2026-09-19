@@ -2,7 +2,7 @@
   "name": "bend2",
   "displayName": "Bend (2.0) Syntax",
   "description": "Syntax highlighting for Bend 2.0 - the parallel proof language (bend-lang.com). Ported from the official bend.sublime-syntax, with law/proof support.",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "publisher": "jk2500",
   "license": "MIT",
   "icon": "icon.png",
@@ -10,7 +10,8 @@
     "vscode": "^1.60.0"
   },
   "categories": [
-    "Programming Languages"
+    "Programming Languages",
+    "Linters"
   ],
   "keywords": [
     "bend",
@@ -43,6 +44,16 @@
         "scopeName": "source.bend",
         "path": "./syntaxes/bend.tmLanguage.json"
       }
+    ],
+    "commands": [
+      {
+        "command": "bend2.check",
+        "title": "Bend: check this file now"
+      }
     ]
-  }
+  },
+  "main": "./src/extension.js",
+  "activationEvents": [
+    "onLanguage:bend"
+  ]
 }
