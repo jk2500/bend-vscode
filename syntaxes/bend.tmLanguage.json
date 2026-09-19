@@ -1,0 +1,100 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Bend",
+  "scopeName": "source.bend",
+  "patterns": [
+    {
+      "match": "#.*$",
+      "name": "comment.line.number-sign.bend"
+    },
+    {
+      "comment": "law/def name",
+      "match": "\\b(def|law)\\s+([A-Za-z_][A-Za-z0-9_.]*)",
+      "captures": {
+        "1": {
+          "name": "keyword.control.bend"
+        },
+        "2": {
+          "name": "entity.name.function.bend"
+        }
+      }
+    },
+    {
+      "match": "\\b(type)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": {
+          "name": "keyword.control.bend"
+        },
+        "2": {
+          "name": "entity.name.type.bend"
+        }
+      }
+    },
+    {
+      "match": "\\b(def|law|type|is|match|case|do|return|for|exs|where|import|as)\\b",
+      "name": "keyword.control.bend"
+    },
+    {
+      "match": "@unsafe\\b",
+      "name": "keyword.control.bend"
+    },
+    {
+      "comment": "the magic proof token",
+      "match": "\\{==\\}",
+      "name": "constant.language.proof.bend"
+    },
+    {
+      "match": "\\b(Type|Data|Kind|Quant)\\b",
+      "name": "storage.type.bend"
+    },
+    {
+      "match": "&[012]\\b",
+      "name": "constant.numeric.use.bend"
+    },
+    {
+      "match": "\\b\\d+n\\b",
+      "name": "constant.numeric.nat.bend"
+    },
+    {
+      "match": "\\b\\d+(\\.\\d+([eE][+-]?\\d+)?)?\\b",
+      "name": "constant.numeric.bend"
+    },
+    {
+      "match": "\\b[A-Z][A-Za-z0-9_]*\\b",
+      "name": "support.type.bend"
+    },
+    {
+      "match": "\\?[A-Za-z_][A-Za-z0-9_]*",
+      "name": "variable.other.hole.bend"
+    },
+    {
+      "begin": "\"",
+      "beginCaptures": [
+        {
+          "name": "punctuation.definition.string.begin.bend"
+        }
+      ],
+      "end": "\"",
+      "endCaptures": [
+        {
+          "name": "punctuation.definition.string.end.bend"
+        }
+      ],
+      "name": "string.quoted.double.bend",
+      "patterns": [
+        {
+          "match": "\\\\.",
+          "name": "constant.character.escape.bend"
+        }
+      ]
+    },
+    {
+      "match": "'(\\\\.|[^'])'",
+      "name": "string.quoted.single.bend"
+    },
+    {
+      "match": "==|!=|<=|>=|->|=>|<-|<&>|\\+\\+|<>|[-+*/%<>=&|!@%\\\\]",
+      "name": "keyword.operator.bend"
+    }
+  ]
+}

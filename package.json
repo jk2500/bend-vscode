@@ -1,0 +1,48 @@
+{
+  "name": "bend2",
+  "displayName": "Bend (2.0) Syntax",
+  "description": "Syntax highlighting for Bend 2.0 - the parallel proof language (bend-lang.com). Ported from the official bend.sublime-syntax, with law/proof support.",
+  "version": "1.0.0",
+  "publisher": "jk2500",
+  "license": "MIT",
+  "icon": "icon.png",
+  "engines": {
+    "vscode": "^1.60.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "keywords": [
+    "bend",
+    "hvm",
+    "higherorderco",
+    "laws",
+    "proofs",
+    "parallel"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jk2500/bend-vscode"
+  },
+  "contributes": {
+    "languages": [
+      {
+        "id": "bend",
+        "aliases": [
+          "Bend"
+        ],
+        "extensions": [
+          ".bend"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "bend",
+        "scopeName": "source.bend",
+        "path": "./syntaxes/bend.tmLanguage.json"
+      }
+    ]
+  }
+}
