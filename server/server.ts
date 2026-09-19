@@ -6,9 +6,9 @@
 // and reports its structured results. Nothing about the language is
 // reimplemented here; this file is only LSP protocol plumbing (zero deps).
 //
-// Phase 2: completions / hover / definition / references / rename /
-// symbols / semantic tokens / folding, all derived from the checker's own
-// Book (tlds, ctrs, term spans) — never from a reimplementation.
+// v2.2: locals (rename/hover), signature help, law-scaffold code action,
+// term_lower-based occurrence walk (the parsed tree hides bodies behind
+// closures until lowered).
 
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -55,18 +55,12 @@ function posOf(src: string, off: number): { line: number; character: number } {
   return { line, character };
 }
 
-function lineLen(src: string, line: number): number {
-  const i = src.split("\n", line).join("\n").length + (line ? 1 : 0);
-  const nl = src.indexOf("\n", i);
-  return (nl < 0 ? src.length : nl) - i;
-}
-
 function rangeOf(spn: { src: string; beg: number; end: number } | undefined) {
   if (!spn) return { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } };
   const start = posOf(spn.src, spn.beg);
   let end = posOf(spn.src, spn.end);
   if (end.line < start.line || (end.line === start.line && end.character <= start.character)) {
-    const cap = lineLen(spn.src, start.line);
+    const cap = (spn.src.split("\n")[start.line] ?? "").length;
     end = { line: start.line, character: Math.min(start.character + 1, Math.max(cap, start.character)) };
   }
   return { start, end };
@@ -74,6 +68,18 @@ function rangeOf(spn: { src: string; beg: number; end: number } | undefined) {
 
 function safeShow(fn: () => string): string {
   try { return fn(); } catch { return "?"; }
+}
+
+// the def's parameter list, from its own type term (tele)
+function teleOf(T: any): { name: string; type: string }[] {
+  const out: { name: string; type: string }[] = [];
+  let t: any = T;
+  try { t = Bend.term_lower(T); } catch { /* keep raw if it cannot lower */ }
+  while (t && t.$ === "All") {
+    out.push({ name: t.k, type: safeShow(() => Bend.term_show(Bend.term_lower(t.A), -1, [])) });
+    t = t.B; // lowered: bodies are plain terms, the chain is walkable
+  }
+  return out;
 }
 
 // ---- workspace model built from the checker's own Book ------------------
@@ -87,7 +93,6 @@ type Cache = { book: any; files: Map<string, FileMeta>; occ: Map<string, Occ[]> 
 
 const caches = new Map<string, Cache>();
 
-// mirror of bend.ts's import scan (organization only; semantics stay in Bend)
 function readImports(text: string): { rel: string; alias: string | null }[] {
   const out: { rel: string; alias: string | null }[] = [];
   for (const raw of text.split("\n")) {
@@ -103,7 +108,6 @@ function stripImports(text: string): string {
   return text.split("\n").map((l) => (/^\s*import\b/.test(l) ? "" : l)).join("\n");
 }
 
-// scan top-level decls and resolve each to its Book key
 function scanDecls(text: string, ns: string, aliases: Record<string, string>): Decl[] {
   const decls: Decl[] = [];
   const lines = text.split("\n");
@@ -141,27 +145,58 @@ function scanDecls(text: string, ns: string, aliases: Record<string, string>): D
   return decls;
 }
 
-function loadFileMeta(filePath: string, ns: string, aliases: Record<string, string>,
-  textOverride: string | null): FileMeta {
-  const text = textOverride ?? fs.readFileSync(filePath, "utf8");
-  return { path: filePath, ns, aliases, text, stripped: stripImports(text), decls: scanDecls(text, ns, aliases) };
+// mirror of bend.ts's namespace join: posix.join normalizes './' away
+function nsJoin(ns: string, rel: string): string {
+  return path.posix.join(path.posix.dirname(ns === "" ? "." : ns), rel).replace(/\.bend$/, "");
 }
 
-// walk terms collecting occurrences with spans (works pre-validation;
-// higher-order checked terms hide subterms behind closures)
-function walkOcc(t: any, out: Occ[], depth = 0): void {
-  if (!t || typeof t !== "object" || depth > 80) return;
-  if (Array.isArray(t)) { for (const x of t) walkOcc(x, out, depth + 1); return; }
-  if (typeof t === "function") return;
-  if ((t.$ === "Ref" || t.$ === "Var" || t.$ === "PVar" || t.$ === "PCtr" || t.$ === "Hol")
-    && t.s && t.s.end > t.s.beg) {
-    const a = posOf(t.s.src, t.s.beg), b = posOf(t.s.src, t.s.end);
-    out.push({ k: t.k, kind: t.$, line: a.line, c0: a.character, c1: b.character });
+function aliasesOf(text: string, ns: string): Record<string, string> {
+  const al: Record<string, string> = {};
+  for (const im of readImports(text)) {
+    if (im.alias) al[im.alias] = nsJoin(ns, im.rel);
   }
-  for (const v of Object.values(t)) if (typeof v === "object") walkOcc(v, out, depth + 1);
+  return al;
 }
 
-// (the direct approach): occurrences with their src, grouped per file
+function importGraph(entryPath: string, entryText: string | null): Map<string, FileMeta> {
+  const files = new Map<string, FileMeta>();
+  const visit = (p: string, ns: string): void => {
+    const real = fs.realpathSync(p);
+    if (files.has(real)) return;
+    const isEntry = real === fs.realpathSync(entryPath);
+    const text = isEntry && entryText !== null ? entryText : fs.readFileSync(real, "utf8");
+    files.set(real, { path: real, ns, aliases: {}, text, stripped: stripImports(text), decls: [] });
+    for (const im of readImports(text)) {
+      if (im.rel === "Base" || im.rel.startsWith("0x") || !im.alias) continue;
+      visit(path.resolve(path.dirname(p), im.rel), nsJoin(ns, im.rel));
+    }
+  };
+  try { visit(entryPath, ""); } catch { /* partial graph is fine */ }
+  for (const meta of files.values()) {
+    meta.aliases = aliasesOf(meta.text, meta.ns);
+    meta.decls = scanDecls(meta.text, meta.ns, meta.aliases);
+  }
+  return files;
+}
+
+// sub-span of each bound name inside a binder span ("+m1" -> name at 1..3)
+function binderNameSpans(k: string | string[], s: any): { name: string; beg: number; end: number }[] {
+  if (!s) return [];
+  const names = Array.isArray(k) ? k : [k];
+  const txt: string = s.src.slice(s.beg, s.end);
+  const out: { name: string; beg: number; end: number }[] = [];
+  let at = 0;
+  for (const nm of names) {
+    const idx = txt.indexOf(nm, at);
+    if (idx < 0) return []; // can't locate: caller must refuse
+    out.push({ name: nm, beg: s.beg + idx, end: s.beg + idx + nm.length });
+    at = idx + nm.length;
+  }
+  return out;
+}
+
+// occurrences with their src, grouped per file. Walks LOWERED terms: the
+// parsed tree keeps bodies behind closures until term_lower applies them.
 function occurrencesByFile(book: any, files: Map<string, FileMeta>): Map<string, Occ[]> {
   const srcToFile = new Map<string, string>();
   for (const [p, meta] of files) srcToFile.set(meta.stripped, p);
@@ -175,17 +210,36 @@ function occurrencesByFile(book: any, files: Map<string, FileMeta>): Map<string,
     out.set(p, arr);
   };
   const walk = (t: any, depth = 0): void => {
-    if (!t || typeof t !== "object" || depth > 80) return;
+    if (!t || typeof t !== "object" || depth > 90) return;
     if (Array.isArray(t)) { for (const x of t) walk(x, depth + 1); return; }
     if (typeof t === "function") return;
-    if ((t.$ === "Ref" || t.$ === "Var" || t.$ === "PVar" || t.$ === "PCtr" || t.$ === "Hol")
-      && t.s && t.s.end > t.s.beg) emit(t.k, t.$, t.s.src, t.s.beg, t.s.end);
+    if (t.s && t.s.end > t.s.beg) {
+      if (t.$ === "Ref" || t.$ === "PCtr") {
+        emit(t.k, t.$, t.s.src, t.s.beg, t.s.end);
+      } else if (t.$ === "Var" || t.$ === "PVar" || t.$ === "Hol") {
+        // span may include a quantifier prefix ("+m1"): trim to the name
+        const txt = t.s.src.slice(t.s.beg, t.s.end);
+        const idx = txt.lastIndexOf(t.k);
+        if (idx >= 0 && t.k.length > 0) emit(t.k, t.$, t.s.src, t.s.beg + idx, t.s.beg + idx + t.k.length);
+        else emit(t.k, t.$, t.s.src, t.s.beg, t.s.end);
+      } else if (t.$ === "Lam" || t.$ === "All" || t.$ === "Let") {
+        for (const b of binderNameSpans(t.k, t.s)) emit(b.name, "binder", t.s.src, b.beg, b.end);
+      }
+    }
     for (const v of Object.values(t)) if (typeof v === "object") walk(v, depth + 1);
   };
   for (const tld of Object.values<any>(book.tlds)) {
-    if (tld.b === true) continue;
-    if (tld.$ === "Def") { if (tld.T) walk(tld.T); if (tld.v) walk(tld.v); if (tld.e) walk(tld.e); }
-    if (tld.$ === "ADT") { walk(tld.T); for (const c of tld.c) walk(c.T); }
+    if (tld.b === true) continue; // Base: not part of this workspace
+    try {
+      if (tld.$ === "Def") {
+        if (tld.T) walk(Bend.term_lower(tld.T));
+        if (tld.v) walk(Bend.term_lower(tld.v));
+        if (tld.e) walk(Bend.term_lower(tld.e));
+      } else if (tld.$ === "ADT") {
+        walk(Bend.term_lower(tld.T));
+        for (const c of tld.c) walk(Bend.term_lower(c.T));
+      }
+    } catch { /* a def that cannot lower still contributes the others */ }
   }
   return out;
 }
@@ -253,13 +307,13 @@ async function check(uri: string): Promise<void> {
     try {
       await Bend.book_load(book, file, "", new Map());
       loaded = true;
-      // cache occurrences BEFORE validation (checked terms hide subterms)
       const entryText = shadow ? text : null;
       const files = importGraph(file, entryText);
       caches.set(uri, { book, files, occ: occurrencesByFile(book, files) });
       Bend.book_valid(book, 0);
     } catch (e: any) {
-      if (loaded) caches.set(uri, { book, files: importGraph(file, shadow ? text : null), occ: new Map() });
+      // the cache built before book_valid (occurrences included) stays: a
+      // file with a type error still has complete structure for navigation
       status = { ...status, errors: 1, ok: false };
       const err = e;
       const todoM = /^Error: (\d+) TODOs?/.exec(String(e));
@@ -320,45 +374,7 @@ async function check(uri: string): Promise<void> {
   }
 }
 
-// mirror of bend.ts's namespace join: posix.join normalizes './' away
-function nsJoin(ns: string, rel: string): string {
-  return path.posix.join(path.posix.dirname(ns === "" ? "." : ns), rel).replace(/\.bend$/, "");
-}
-
-// import graph with namespaces, mirroring bend.ts's own resolution
-function importGraph(entryPath: string, entryText: string | null): Map<string, FileMeta> {
-  const files = new Map<string, FileMeta>();
-  const nsOf = (ns: string, rel: string): string =>
-    path.posix.join(path.posix.dirname(ns === "" ? "." : ns), rel).replace(/\.bend$/, "");
-  const visit = (p: string, ns: string): void => {
-    const real = fs.realpathSync(p);
-    if (files.has(real)) return;
-    const isEntry = real === fs.realpathSync(entryPath);
-    const text = isEntry && entryText !== null ? entryText : fs.readFileSync(real, "utf8");
-    files.set(real, { path: real, ns, aliases: {}, text, stripped: stripImports(text), decls: [] });
-    for (const im of readImports(text)) {
-      if (im.rel === "Base" || im.rel.startsWith("0x")) continue;
-      if (!im.alias) continue;
-      visit(path.resolve(path.dirname(p), im.rel), nsOf(ns, im.rel));
-    }
-  };
-  try { visit(entryPath, ""); } catch { /* partial graph is fine */ }
-  for (const meta of files.values()) {
-    meta.aliases = aliasesOf(meta, files);
-    meta.decls = scanDecls(meta.text, meta.ns, meta.aliases);
-  }
-  return files;
-}
-
-function aliasesOf(meta: FileMeta, _files: Map<string, FileMeta>): Record<string, string> {
-  const al: Record<string, string> = {};
-  for (const im of readImports(meta.text)) {
-    if (im.alias) al[im.alias] = nsJoin(meta.ns, im.rel);
-  }
-  return al;
-}
-
-// ---- Phase 2: features over the cached Book ------------------------------
+// ---- Phase 2 features over the cached Book ------------------------------
 
 function cacheOf(uri: string): Cache | undefined {
   return caches.get(uri) ?? [...caches.entries()].find(([, c]) => c.files.has(uriFile(uri)))?.[1];
@@ -369,7 +385,6 @@ function uriFile(uri: string): string | null {
   catch { return null; }
 }
 
-// resolve the word at a position to a Book key
 function keyAt(uri: string, line: number, ch: number): { key: string; occ: Occ; meta: FileMeta } | null {
   const cache = cacheOf(uri);
   if (!cache) return null;
@@ -377,15 +392,35 @@ function keyAt(uri: string, line: number, ch: number): { key: string; occ: Occ; 
   if (!file) return null;
   const meta = cache.files.get(file);
   const occs = cache.occ.get(file) ?? [];
-  const occ = occs.find((o) => o.line === line && ch >= o.c0 && ch <= o.c1);
+  const occ = occs.find((o) => o.line === line && ch >= o.c0 && ch <= o.c1
+    && o.kind !== "Var" && o.kind !== "PVar" && o.kind !== "binder");
   if (occ && meta) return { key: occ.k, occ, meta };
-  // fall back: decl site?
   if (meta) {
     for (const d of meta.decls) {
       if (d.key && d.line === line && ch >= d.c0 && ch <= d.c1) return { key: d.key, occ: { k: d.key, kind: "decl", line, c0: d.c0, c1: d.c1 }, meta };
     }
   }
   return null;
+}
+
+// the local at a position (Var/PVar use or binder), and its enclosing def
+function localAt(uri: string, line: number, ch: number):
+  { name: string; defKey: string | null; occ: Occ } | null {
+  const cache = cacheOf(uri);
+  const file = uriFile(uri);
+  if (!cache || !file) return null;
+  const meta = cache.files.get(file);
+  if (!meta) return null;
+  const occs = cache.occ.get(file) ?? [];
+  const occ = occs.find((o) => (o.kind === "Var" || o.kind === "PVar" || o.kind === "binder")
+    && o.line === line && ch >= o.c0 && ch <= o.c1);
+  if (!occ) return null;
+  let defKey: string | null = null;
+  let best = -1;
+  for (const d of meta.decls) {
+    if (d.key && d.line <= line && d.line > best) { best = d.line; defKey = d.key; }
+  }
+  return { name: occ.k, defKey, occ };
 }
 
 function declSitesOfKey(key: string): { uri: string; range: any; kind: string }[] {
@@ -417,7 +452,10 @@ function hoverOf(key: string, book: any): string | null {
     const t = safeShow(() => Bend.term_show(Bend.term_lower(tld.T), -1, []));
     const base = tld.b === true ? " — Base" : "";
     const law = tld.$ === "Def" && tld.v === null ? " (open law)" : "";
-    return "```bend\n" + kind + " " + key + base + law + "\n  :: " + t + "\n```";
+    const tele = tld.$ === "Def" && tld.v !== null && tld.T
+      ? teleOf(tld.T).map((p) => p.name + ": " + p.type).join(", ") : null;
+    return "```bend\n" + kind + " " + key + base + law + "\n  :: " + t + "\n```"
+      + (tele ? "\n```bend\n(" + tele + ")\n```" : "");
   }
   if (ctr) {
     const t = safeShow(() => Bend.term_show(Bend.term_lower(ctr.T), -1, []));
@@ -498,7 +536,7 @@ function semanticTokensOf(uri: string): { data: number[] } | null {
   }
   for (const o of occs) {
     const t = o.kind === "PCtr" || (o.kind === "Ref" && book.ctrs[o.k] !== undefined) ? 3
-      : o.kind === "Var" ? 4 : o.kind === "PVar" ? 5
+      : o.kind === "Var" ? 4 : o.kind === "PVar" || o.kind === "binder" ? 5
       : o.kind === "Hol" ? 6 : o.kind === "Ref" ? 0 : 4;
     push(o.line, o.c0, o.c1 - o.c0, t);
   }
@@ -543,6 +581,132 @@ function foldingOf(uri: string): any[] | null {
   return out;
 }
 
+// ---- signature help -------------------------------------------------------
+
+// find the innermost unclosed '(' before the cursor and the callee name
+function callAt(text: string, line: number, ch: number):
+  { name: string; argIndex: number } | null {
+  const upto = text.split("\n").slice(0, line + 1).join("\n").slice(0,
+    text.split("\n", line).join("\n").length + (line ? 1 : 0) + ch);
+  let depth = 0;
+  let argIdx = 0;
+  for (let i = upto.length - 1; i >= 0; i--) {
+    const c = upto[i];
+    if (c === ")" || c === "}" || c === "]") depth++;
+    else if (c === "(" || c === "{" || c === "[") {
+      if (depth === 0 && c === "(") {
+        const before = upto.slice(0, i);
+        const m = /([A-Za-z_][\w.]*)\s*$/.exec(before);
+        if (!m) return null;
+        return { name: m[1], argIndex: argIdx };
+      }
+      depth--;
+    } else if (depth === 0 && c === ",") argIdx++;
+    else if (depth === 0 && (c === "\"" || c === "#")) {
+      // naive: stop scanning at a string or comment boundary going backwards
+      const lineTxt = text.split("\n")[line] ?? "";
+      if (c === "#" && upto.slice(0, i).split("\n").pop() === lineTxt.slice(0, i - (upto.length - lineTxt.length))) return null;
+    }
+  }
+  return null;
+}
+
+function signatureHelpFor(uri: string, line: number, ch: number): any | null {
+  const doc = docOf(uri);
+  const cache = cacheOf(uri);
+  if (!doc || !cache) return null;
+  const call = callAt(doc.text, line, ch);
+  if (!call) return null;
+  // resolve the callee to a book key: occurrence at its position, or by name
+  const file = uriFile(uri);
+  const meta = file ? cache.files.get(file) : undefined;
+  if (!file || !meta) return null;
+  const before = doc.text.split("\n", line).join("\n").length + (line ? 1 : 0);
+  const m = new RegExp("([A-Za-z_][\\w.]*)\\s*\\(");
+  void m; void before;
+  // position of the callee: search occurrences on this line with k ending at name
+  const occs = cache.occ.get(file) ?? [];
+  const nameWord = call.name.split(".").pop() ?? call.name;
+  let key: string | null = null;
+  // occurrence matching the callee token (Ref kind)
+  const lineText = doc.text.split("\n")[line] ?? "";
+  const col = lineText.lastIndexOf(call.name + "(", ch) >= 0
+    ? lineText.lastIndexOf(call.name + "(", ch) : null;
+  if (col !== null) {
+    const occ = occs.find((o) => o.line === line && o.c0 >= (col ?? 0) && o.c0 <= (col ?? 0) + call.name.length + 1
+      && (o.kind === "Ref" || o.kind === "decl"));
+    if (occ) key = occ.k;
+  }
+  if (key === null) {
+    // resolve a bare/dotted name through the file's aliases (as written)
+    const parts = call.name.split(".");
+    if (parts.length > 1 && meta.aliases[parts[0]] !== undefined) {
+      key = meta.aliases[parts[0]] + "." + parts.slice(1).join(".");
+    } else if (parts.length > 1 && !meta.ns) {
+      key = call.name;
+    } else {
+      const cand = meta.ns ? meta.ns + "." + nameWord : nameWord;
+      key = cache.book.tlds[cand] !== undefined ? cand
+        : (cache.book.tlds[call.name] !== undefined ? call.name : null);
+    }
+  }
+  if (key === null || cache.book.tlds[key] === undefined) return null;
+  const tld = cache.book.tlds[key];
+  if (tld.$ !== "Def" || !tld.T) return null;
+  const tele = teleOf(tld.T);
+  if (tele.length === 0) return null;
+  const rest = safeShow(() => Bend.term_show(Bend.term_lower((function findRest(t: any): any {
+    while (t && t.$ === "All") t = t.B;
+    return t;
+  })(tld.T)), -1, []));
+  const label = key + "(" + tele.map((p) => p.name + ": " + p.type).join(", ") + ")";
+  let idx = 0;
+  const params = tele.map((p) => {
+    const beg = label.indexOf(p.name + ": ", idx);
+    const end = beg + (p.name + ": " + p.type).length;
+    idx = end;
+    return { label: [beg, end] };
+  });
+  return { signatures: [{ label, parameters: params }], activeSignature: 0,
+    activeParameter: Math.min(call.argIndex, tele.length - 1) };
+}
+
+// ---- rename (top-level and local) -----------------------------------------
+
+async function recheckRenames(text: string, dir: string): Promise<boolean> {
+  // a rename is only offered if the result still parses and loads
+  if (!Bend) return false;
+  const tmp = path.join(dir, ".bendlsp-rename-check.bend");
+  try {
+    fs.writeFileSync(tmp, text, "utf8");
+    const book = Bend.book_nil();
+    await Bend.book_load(book, tmp, "", new Map());
+    return true;
+  } catch {
+    return false;
+  } finally {
+    try { fs.unlinkSync(tmp); } catch { /* best effort */ }
+  }
+}
+
+// is this law filled by a def in any loaded file? (keys are entry-relative,
+// so match by name across files whose import graph includes the law's file)
+function lawProvenSomewhere(lawFile: string, lawName: string): boolean {
+  const nm = lawName.split(".").pop()!;
+  for (const [, c] of caches) {
+    for (const [p, meta] of c.files) {
+      if (p === lawFile) continue;
+      const d2 = meta.decls.find((x) =>
+        x.kind === "def" && x.name.split(".").pop() === nm);
+      if (!d2) continue;
+      const importsLaw = Object.values(meta.aliases).some((ns) =>
+        [...c.files.values()].some((f) => f.ns === ns && f.path === lawFile));
+      if (importsLaw) return true;
+    }
+  }
+  return false;
+}
+
 // ---- LSP plumbing --------------------------------------------------------
 
 const peer = new RpcPeer(process.stdin, process.stdout);
@@ -571,6 +735,10 @@ peer.notificationHandler = (method: string, params: any) => {
       caches.delete(params.textDocument.uri);
       peer.notify("textDocument/publishDiagnostics", { uri: params.textDocument.uri, diagnostics: [] });
       return;
+    case "workspace/didChangeWatchedFiles":
+      // an imported file changed on disk: re-check every open bend doc
+      for (const uri of docs.keys()) schedule(uri, 0);
+      return;
     case "exit": process.exit(0); return;
     default: return;
   }
@@ -591,6 +759,8 @@ peer.requestHandler = async (method: string, params: any) => {
         workspaceSymbolProvider: true,
         renameProvider: { prepareProvider: true },
         foldingRangeProvider: true,
+        signatureHelpProvider: { triggerCharacters: ["(", ","] },
+        codeActionProvider: { codeActionKinds: ["refactor"] },
         semanticTokensProvider: {
           legend: { tokenTypes: TOKEN_TYPES, tokenModifiers: [] },
           full: true,
@@ -618,10 +788,23 @@ peer.requestHandler = async (method: string, params: any) => {
     }
     case "textDocument/hover": {
       const at = keyAt(params.textDocument.uri, params.position.line, params.position.character);
-      if (!at) return null;
+      if (at) {
+        const cache = cacheOf(params.textDocument.uri)!;
+        const h = hoverOf(at.key, cache.book);
+        return h ? { contents: { kind: "markdown", value: h } } : null;
+      }
+      // a local: parameter (type from the def's tele) or let/pattern binding
+      const loc = localAt(params.textDocument.uri, params.position.line, params.position.character);
+      if (!loc) return null;
       const cache = cacheOf(params.textDocument.uri)!;
-      const h = hoverOf(at.key, cache.book);
-      return h ? { contents: { kind: "markdown", value: h } } : null;
+      let extra = "";
+      if (loc.defKey && cache.book.tlds[loc.defKey] && cache.book.tlds[loc.defKey].T) {
+        const tele = teleOf(cache.book.tlds[loc.defKey].T);
+        const param = tele.find((p) => p.name === loc.name);
+        if (param) extra = "\n```bend\n" + loc.name + ": " + param.type + "\n```";
+      }
+      const value = "```bend\n" + loc.name + " — local" + (loc.defKey ? " in " + loc.defKey : "") + "\n```" + extra;
+      return { contents: { kind: "markdown", value } };
     }
     case "textDocument/definition": {
       const at = keyAt(params.textDocument.uri, params.position.line, params.position.character);
@@ -633,8 +816,7 @@ peer.requestHandler = async (method: string, params: any) => {
       const at = keyAt(params.textDocument.uri, params.position.line, params.position.character);
       if (!at) return null;
       const out: any[] = [];
-      for (const [uri, cache] of caches) {
-        void uri;
+      for (const [, cache] of caches) {
         for (const [p, occs] of cache.occ) {
           for (const o of occs) {
             if (o.k === at.key) out.push({ uri: pathToFileURL(p).href,
@@ -649,43 +831,83 @@ peer.requestHandler = async (method: string, params: any) => {
     }
     case "textDocument/prepareRename": {
       const at = keyAt(params.textDocument.uri, params.position.line, params.position.character);
-      if (!at) return null;
-      // locals (de Bruijn) need scope analysis; only top-level names for now
-      if (at.occ.kind === "Var" || at.occ.kind === "PVar") return null;
-      const cache = cacheOf(params.textDocument.uri)!;
-      if (!cache.book.tlds[at.key] && !cache.book.ctrs[at.key]) return null;
-      return { range: { start: { line: at.occ.line, character: at.occ.c0 },
-        end: { line: at.occ.line, character: at.occ.c1 } }, placeholder: at.key };
+      const loc = at ? null : localAt(params.textDocument.uri, params.position.line, params.position.character);
+      const target = at ? { range: { start: { line: at.occ.line, character: at.occ.c0 },
+        end: { line: at.occ.line, character: at.occ.c1 } }, placeholder: at.key }
+        : loc ? { range: { start: { line: loc.occ.line, character: loc.occ.c0 },
+          end: { line: loc.occ.line, character: loc.occ.c1 } }, placeholder: loc.name } : null;
+      if (!target) return null;
+      if (at) {
+        const cache = cacheOf(params.textDocument.uri)!;
+        if (!cache.book.tlds[at.key] && !cache.book.ctrs[at.key]) return null;
+      }
+      return target;
     }
     case "textDocument/rename": {
-      const at = keyAt(params.textDocument.uri, params.position.line, params.position.character);
-      if (!at) return null;
+      const uri = params.textDocument.uri;
       const newName: string = params.newName;
+      const line = params.position.line, ch = params.position.character;
+      const cache = cacheOf(uri);
+      const file = uriFile(uri);
+      if (!cache || !file) return null;
+      const meta = cache.files.get(file);
+      if (!meta) return null;
+      const at = keyAt(uri, line, ch);
       const changes: Record<string, any[]> = {};
-      const add = (uri: string, line: number, c0: number, c1: number) => {
-        (changes[uri] = changes[uri] ?? []).push(
-          { range: { start: { line, character: c0 }, end: { line, character: c1 } }, newText: newName });
+      const add = (u: string, l: number, c0: number, c1: number) => {
+        (changes[u] = changes[u] ?? []).push(
+          { range: { start: { line: l, character: c0 }, end: { line: l, character: c1 } }, newText: newName });
       };
-      let count = 0;
-      for (const [, cache] of caches) {
-        for (const [p, occs] of cache.occ) {
-          for (const o of occs) {
-            if (o.k === at.key && o.kind !== "Var" && o.kind !== "PVar") {
-              add(pathToFileURL(p).href, o.line, o.c0, o.c1);
-              count++;
+      if (at) {
+        // top-level rename: name-keyed occurrences across every known file
+        let count = 0;
+        for (const [, c] of caches) {
+          for (const [p, occs] of c.occ) {
+            for (const o of occs) {
+              if (o.k === at.key && o.kind !== "Var" && o.kind !== "PVar" && o.kind !== "binder") {
+                add(pathToFileURL(p).href, o.line, o.c0, o.c1);
+                count++;
+              }
+            }
+          }
+          for (const [p, m2] of c.files) {
+            for (const d of m2.decls) {
+              if (d.key === at.key) { add(pathToFileURL(p).href, d.line, d.c0, d.c1); count++; }
             }
           }
         }
-        for (const [p, meta] of cache.files) {
-          for (const d of meta.decls) {
-            if (d.key === at.key) {
-              add(pathToFileURL(p).href, d.line, d.c0, d.c1);
-              count++;
-            }
-          }
-        }
+        return count > 0 ? { changes } : null;
       }
-      return count > 0 ? { changes } : null;
+      // local rename: every Var/PVar/binder span of this name inside the
+      // enclosing def (shadowing preserves semantics; Refs never match)
+      const loc = localAt(uri, line, ch);
+      if (!loc || !loc.defKey) return null;
+      const decl = meta.decls.find((d) => d.key === loc.defKey)!;
+      let next = meta.decls.find((d) => d.line > decl.line);
+      const endLine = next ? next.line : meta.text.split("\n").length;
+      const occs = cache.occ.get(file) ?? [];
+      const seen = new Set<string>();
+      const spans = occs.filter((o) => {
+        if (!((o.kind === "Var" || o.kind === "PVar" || o.kind === "binder")
+          && o.k === loc.name && o.line >= decl.line && o.line < endLine)) return false;
+        const id = o.line + ":" + o.c0 + ":" + o.c1; // the same token can be binder and use
+        if (seen.has(id)) return false;
+        seen.add(id);
+        return true;
+      });
+      if (spans.length === 0) return null;
+      // build the edited text and let the real checker confirm it still loads
+      const lines = meta.text.split("\n");
+      const edited = lines.map((l, i) => {
+        const onLine = spans.filter((s) => s.line === i).sort((a, b) => b.c0 - a.c0);
+        for (const s of onLine) {
+          l = l.slice(0, s.c0) + newName + l.slice(s.c1);
+        }
+        return l;
+      }).join("\n");
+      if (!await recheckRenames(edited, path.dirname(file))) return null;
+      for (const s of spans) add(uri, s.line, s.c0, s.c1);
+      return { changes };
     }
     case "textDocument/documentSymbol": {
       const cache = cacheOf(params.textDocument.uri);
@@ -695,8 +917,7 @@ peer.requestHandler = async (method: string, params: any) => {
       if (!meta) return [];
       return meta.decls.map((d) => ({
         name: d.name,
-        kind: d.kind === "type" ? 23 : d.kind === "import" ? 2 : (cache.book.tlds[d.key!]?.$ === "Def"
-          && cache.book.tlds[d.key!].v === null ? 12 : 12),
+        kind: d.kind === "type" ? 23 : d.kind === "import" ? 2 : 12,
         location: { uri: params.textDocument.uri,
           range: { start: { line: d.line, character: d.c0 }, end: { line: d.line, character: d.c1 } } },
       }));
@@ -704,8 +925,7 @@ peer.requestHandler = async (method: string, params: any) => {
     case "workspace/symbol": {
       const q: string = (params.query || "").toLowerCase();
       const out: any[] = [];
-      for (const [uri, cache] of caches) {
-        void uri;
+      for (const [, cache] of caches) {
         for (const [p, meta] of cache.files) {
           for (const d of meta.decls) {
             if (d.kind === "import") continue;
@@ -722,6 +942,52 @@ peer.requestHandler = async (method: string, params: any) => {
       return foldingOf(params.textDocument.uri);
     case "textDocument/semanticTokens/full":
       return semanticTokensOf(params.textDocument.uri);
+    case "textDocument/signatureHelp":
+      return signatureHelpFor(params.textDocument.uri, params.position.line, params.position.character);
+    case "textDocument/codeAction": {
+      // "Bend: prove this law" — scaffold a def with the law's parameters
+      const uri = params.textDocument.uri;
+      const cache = cacheOf(uri);
+      const file = uriFile(uri);
+      if (!cache || !file) return [];
+      const meta = cache.files.get(file);
+      if (!meta) return [];
+      const range = params.range;
+      const out: any[] = [];
+      for (const d of meta.decls) {
+        if (d.kind !== "law" || d.key === undefined) continue;
+        if (d.line < range.start.line || d.line > range.end.line) continue;
+        const tld = cache.book.tlds[d.key];
+        if (!tld || tld.$ !== "Def") continue;
+        if (lawProvenSomewhere(file, d.name)) continue; // filled by a def (often PROOF.bend)
+        // law parameters, straight from the user's `for x: T` lines (the
+        // lowered type desugars them into Exists/Lam wrappers)
+        const lines = meta.text.split("\n");
+        const params: string[] = [];
+        for (let i = d.line + 1; i < lines.length; i++) {
+          if (/^\s*$/.test(lines[i])) continue;
+          const mF = /^\s*for\s+([+-~]?)([A-Za-z_]\w*)\s*:/.exec(lines[i]);
+          if (mF) { params.push(mF[2]); continue; }
+          if (/^\s*exs\s/.test(lines[i])) continue; // a witness, not a parameter
+          break; // the claim body starts here
+        }
+        const insertAt = (() => {
+          const next = meta.decls.find((x) => x.line > d.line);
+          let end = (next ? next.line : lines.length);
+          while (end - 1 > d.line && !lines[end - 1].trim()) end--;
+          return end;
+        })();
+        const scaffold = "def " + d.name + "(" + params.join(", ") + "):\n  ?TODO\n";
+        out.push({
+          title: "Bend: prove this law (scaffold def with ?TODO)",
+          kind: "refactor",
+          edit: { changes: { [uri]: [{ range: {
+            start: { line: insertAt, character: 0 }, end: { line: insertAt, character: 0 } },
+            newText: scaffold }] } },
+        });
+      }
+      return out;
+    }
     default: throw new Error("MethodNotFound: " + method);
   }
 };

@@ -15,6 +15,18 @@ CLI-text checking.
 
 ## Features
 
+### Locals, signatures, law scaffolding (v2.2)
+- **Rename and hover for locals**: parameters, `let`/pattern bindings — every
+  use found via the checker's own lowered terms; a local rename is only
+  applied if the result still loads through the real checker
+- **Signature help** while typing a call: `U32.mul(a: U32, b: U32)` with the
+  active parameter highlighted, types from the def's own type term
+- **Code action on an open law**: "Bend: prove this law" scaffolds
+  `def name(params): ?TODO` under the claim, with the law's `for` parameters
+  (laws already filled by a def get no action)
+- **Re-check on imported-file change**: editing a dependency re-checks open
+  files automatically
+
 ### Full language features (v2.1) — from the real checker's symbol table
 - **Completions**: every def/law/type/constructor visible from the current
   file — all of Base (400+ names), workspace defs, and module-qualified
