@@ -15,6 +15,17 @@ CLI-text checking.
 
 ## Features
 
+### Whole-project intelligence (v2.3)
+- **Workspace-wide index**: symbols, definitions, references and rename cover
+  every `.bend` file under the workspace root — including files never opened
+- **Project diagnostics at startup**: every workspace file is checked through
+  the real checker and lands in Problems without being opened
+- **Document highlight, selection ranges** (real term spans), **import links**,
+  **parameter-name inlay hints**, **call hierarchy** (incoming + outgoing,
+  Base callees resolve into `base.bend`), **formatter** (whitespace-safe:
+  trailing whitespace and final newline only — indentation is semantic in
+  Bend, so it is never touched)
+
 ### Locals, signatures, law scaffolding (v2.2)
 - **Rename and hover for locals**: parameters, `let`/pattern bindings — every
   use found via the checker's own lowered terms; a local rename is only

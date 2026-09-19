@@ -120,6 +120,102 @@ function register(client, ctx) {
       },
     }),
 
+
+    vscode.languages.registerDocumentHighlightProvider(sel, {
+      provideDocumentHighlights: async (doc, pos) => {
+        const s = srv(); if (!s) return [];
+        const res = await s.request('textDocument/documentHighlight', {
+          textDocument: { uri: doc.uri.toString() }, position: { line: pos.line, character: pos.character } });
+        return (res || []).map(h => new vscode.DocumentHighlight(toRange(h.range),
+          h.kind === 2 ? vscode.DocumentHighlightKind.Write : vscode.DocumentHighlightKind.Read));
+      },
+    }),
+
+    vscode.languages.registerSelectionRangeProvider(sel, {
+      provideSelectionRanges: async (doc, positions) => {
+        const s = srv(); if (!s) return [];
+        const res = await s.request('textDocument/selectionRange', {
+          textDocument: { uri: doc.uri.toString() },
+          positions: positions.map(p => ({ line: p.line, character: p.character })) });
+        const conv = (r) => r ? { range: toRange(r.range), parent: conv(r.parent) } : undefined;
+        return (res || []).map(conv);
+      },
+    }),
+
+    vscode.languages.registerInlayHintsProvider(sel, {
+      provideInlayHints: async (doc, range) => {
+        const s = srv(); if (!s) return [];
+        const res = await s.request('textDocument/inlayHint', {
+          textDocument: { uri: doc.uri.toString() },
+          range: { start: { line: range.start.line, character: range.start.character },
+                   end: { line: range.end.line, character: range.end.character } } });
+        return (res || []).map(h => new vscode.InlayHint(
+          new vscode.Position(h.position.line, h.position.character), h.label,
+          h.kind === 2 ? vscode.InlayHintKind.Parameter : vscode.InlayHintKind.Type));
+      },
+    }),
+
+    vscode.languages.registerCallHierarchyProvider(sel, {
+      prepareCallHierarchy: async (doc, pos) => {
+        const s = srv(); if (!s) return null;
+        const res = await s.request('callHierarchy/prepare', {
+          textDocument: { uri: doc.uri.toString() }, position: { line: pos.line, character: pos.character } });
+        if (!res || !res[0]) return null;
+        const it = res[0];
+        return new vscode.CallHierarchyItem(vscode.SymbolKind.Function, it.name, '',
+          vscode.Uri.parse(it.uri), toRange(it.range), toRange(it.selectionRange));
+      },
+      provideCallHierarchyIncomingCalls: async (item) => {
+        const s = srv(); if (!s) return [];
+        const res = await s.request('callHierarchy/incomingCalls', { item: {
+          name: item.name, kind: 12, uri: item.uri.toString(),
+          range: { start: { line: item.range.start.line, character: item.range.start.character },
+                   end: { line: item.range.end.line, character: item.range.end.character } },
+          selectionRange: { start: { line: item.selectionRange.start.line, character: item.selectionRange.start.character },
+                   end: { line: item.selectionRange.end.line, character: item.selectionRange.end.character } } } });
+        return (res || []).map(c => new vscode.CallHierarchyIncomingCall(
+          new vscode.CallHierarchyItem(vscode.SymbolKind.Function, c.name, '',
+            vscode.Uri.parse(c.uri), toRange(c.range), toRange(c.selectionRange)),
+          c.fromRanges.map(toRange)));
+      },
+      provideCallHierarchyOutgoingCalls: async (item) => {
+        const s = srv(); if (!s) return [];
+        const res = await s.request('callHierarchy/outgoingCalls', { item: {
+          name: item.name, kind: 12, uri: item.uri.toString(),
+          range: { start: { line: item.range.start.line, character: item.range.start.character },
+                   end: { line: item.range.end.line, character: item.range.end.character } },
+          selectionRange: { start: { line: item.selectionRange.start.line, character: item.selectionRange.start.character },
+                   end: { line: item.selectionRange.end.line, character: item.selectionRange.end.character } } } });
+        return (res || []).map(c => new vscode.CallHierarchyOutgoingCall(
+          new vscode.CallHierarchyItem(vscode.SymbolKind.Function, c.name, '',
+            vscode.Uri.parse(c.uri), toRange(c.range), toRange(c.selectionRange)),
+          c.fromRanges.map(toRange)));
+      },
+    }),
+
+    vscode.languages.registerDocumentLinkProvider(sel, {
+      provideDocumentLinks: async (doc) => {
+        const s = srv(); if (!s) return [];
+        const res = await s.request('textDocument/documentLink', {
+          textDocument: { uri: doc.uri.toString() } });
+        return (res || []).map(l => {
+          const link = new vscode.DocumentLink(toRange(l.range));
+          if (l.target) link.target = vscode.Uri.parse(l.target);
+          return link;
+        });
+      },
+    }),
+
+    vscode.languages.registerDocumentFormattingEditProvider(sel, {
+      provideDocumentFormattingEdits: async (doc) => {
+        const s = srv(); if (!s) return [];
+        const res = await s.request('textDocument/formatting', {
+          textDocument: { uri: doc.uri.toString() }, options: {} });
+        return (res || []).map(e => vscode.TextEdit.replace(toRange(e.range), e.newText));
+      },
+    }),
+
+
     vscode.languages.registerDocumentSemanticTokensProvider(sel, {
       provideDocumentSemanticTokens: async (doc) => {
         const s = srv(); if (!s) return null;
