@@ -12,6 +12,7 @@ const path = require('path');
 const fs = require('fs');
 const { RpcPeer } = require('./rpc');
 const { parseBendOutput } = require('./bendParser');
+const providers = require('./providers');
 
 const BEND = path.join(os.homedir(), '.bend', 'bin', 'bend');
 const TIMEOUT_MS = 15000;
@@ -141,6 +142,7 @@ function showStatus(status, s) {
 
 function activate(ctx) {
   const diag = vscode.languages.createDiagnosticCollection('bend');
+  providers.register(() => server, ctx);
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
   status.command = 'bend2.check';
   ctx.subscriptions.push(diag, status,

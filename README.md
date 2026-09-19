@@ -15,6 +15,22 @@ CLI-text checking.
 
 ## Features
 
+### Full language features (v2.1) — from the real checker's symbol table
+- **Completions**: every def/law/type/constructor visible from the current
+  file — all of Base (400+ names), workspace defs, and module-qualified
+  names (`L.foo` after `import ./LAWS.bend as L`), plus keywords and snippets
+- **Hover**: a name's kind, signature and claim, rendered by Bend itself
+  (`law one_plus_one :: {Nat.add(1n, 1n) == 2n : Nat}`)
+- **Go to definition**: resolves through module aliases; a def that fills a
+  law jumps to the law's claim
+- **Find references / rename** across files, on top-level names
+- **Document & workspace symbols** (outline, ⌘T), laws and defs distinguished
+- **Semantic tokens**: exact coloring of defs, laws, types, constructors,
+  parameters, variables and holes — replacing guess-based highlighting
+- **Folding** by indentation blocks
+
+### Diagnostics (v2.0)
+
 - **Exact diagnostics as you type** (300 ms debounce): the checker's
   `expected / observed` message with the def name and local bindings, with a
   squiggle on the exact character range — not the whole line

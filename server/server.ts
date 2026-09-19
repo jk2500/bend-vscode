@@ -6,7 +6,9 @@
 // and reports its structured results. Nothing about the language is
 // reimplemented here; this file is only LSP protocol plumbing (zero deps).
 //
-// Run: bun server.ts   (speakes LSP over stdio)
+// Phase 2: completions / hover / definition / references / rename /
+// symbols / semantic tokens / folding, all derived from the checker's own
+// Book (tlds, ctrs, term spans) — never from a reimplementation.
 
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -31,9 +33,8 @@ function findBendTs(): string | null {
   const app = path.join(home, "app");
   if (fs.existsSync(app)) {
     for (const ver of fs.readdirSync(app).filter((d) => /^\d/.test(d)).sort(versCmp).reverse()) {
-      const vdir = path.join(app, ver);
-      for (const hash of fs.readdirSync(vdir)) {
-        const p = path.join(vdir, hash, "bend2", "bend.ts");
+      for (const hash of fs.readdirSync(path.join(app, ver))) {
+        const p = path.join(app, ver, hash, "bend2", "bend.ts");
         if (fs.existsSync(p)) return p;
       }
     }
@@ -60,7 +61,6 @@ function lineLen(src: string, line: number): number {
   return (nl < 0 ? src.length : nl) - i;
 }
 
-// a visible range for a span: widen point spans by one character on the line
 function rangeOf(spn: { src: string; beg: number; end: number } | undefined) {
   if (!spn) return { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } };
   const start = posOf(spn.src, spn.beg);
@@ -76,6 +76,120 @@ function safeShow(fn: () => string): string {
   try { return fn(); } catch { return "?"; }
 }
 
+// ---- workspace model built from the checker's own Book ------------------
+
+type Occ = { k: string; kind: string; line: number; c0: number; c1: number };
+type Decl = { kind: "def" | "law" | "type" | "import"; name: string; key: string | null;
+  line: number; c0: number; c1: number };
+type FileMeta = { path: string; ns: string; aliases: Record<string, string>;
+  text: string; stripped: string; decls: Decl[] };
+type Cache = { book: any; files: Map<string, FileMeta>; occ: Map<string, Occ[]> };
+
+const caches = new Map<string, Cache>();
+
+// mirror of bend.ts's import scan (organization only; semantics stay in Bend)
+function readImports(text: string): { rel: string; alias: string | null }[] {
+  const out: { rel: string; alias: string | null }[] = [];
+  for (const raw of text.split("\n")) {
+    const t = raw.trim();
+    if (t && !t.startsWith("#") && !t.startsWith("import")) break; // header only
+    const m = /^import\s+(\S+)(?:\s+as\s+([A-Za-z_][A-Za-z0-9_]*))?\s*(?:#.*)?$/.exec(t);
+    if (m) out.push({ rel: m[1], alias: m[2] || null });
+  }
+  return out;
+}
+
+function stripImports(text: string): string {
+  return text.split("\n").map((l) => (/^\s*import\b/.test(l) ? "" : l)).join("\n");
+}
+
+// scan top-level decls and resolve each to its Book key
+function scanDecls(text: string, ns: string, aliases: Record<string, string>): Decl[] {
+  const decls: Decl[] = [];
+  const lines = text.split("\n");
+  const keyOf = (nm: string): string | null => {
+    const parts = nm.split(".");
+    if (parts.length > 1) {
+      const target = aliases[parts[0]];
+      if (target !== undefined) return target + "." + parts.slice(1).join(".");
+      return nm; // dotted name with unknown alias: keep as written
+    }
+    return ns ? ns + "." + nm : nm;
+  };
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    if (/^\s/.test(l)) continue; // top level is column 0
+    let m = /^(def|law)\s+([A-Za-z_][\w.]*)/.exec(l);
+    if (m) {
+      const c0 = l.indexOf(m[2]);
+      decls.push({ kind: m[1] as "def" | "law", name: m[2], key: keyOf(m[2]), line: i, c0, c1: c0 + m[2].length });
+      continue;
+    }
+    m = /^type\s+([A-Za-z_]\w*)/.exec(l);
+    if (m) {
+      const c0 = l.indexOf(m[1]);
+      decls.push({ kind: "type", name: m[1], key: keyOf(m[1]), line: i, c0, c1: c0 + m[1].length });
+      continue;
+    }
+    m = /^import\s+(\S+)(?:\s+as\s+(\w+))?/.exec(l);
+    if (m) {
+      const shown = m[2] || m[1];
+      const c0 = l.indexOf(shown, 6);
+      decls.push({ kind: "import", name: shown, key: null, line: i, c0, c1: c0 + shown.length });
+    }
+  }
+  return decls;
+}
+
+function loadFileMeta(filePath: string, ns: string, aliases: Record<string, string>,
+  textOverride: string | null): FileMeta {
+  const text = textOverride ?? fs.readFileSync(filePath, "utf8");
+  return { path: filePath, ns, aliases, text, stripped: stripImports(text), decls: scanDecls(text, ns, aliases) };
+}
+
+// walk terms collecting occurrences with spans (works pre-validation;
+// higher-order checked terms hide subterms behind closures)
+function walkOcc(t: any, out: Occ[], depth = 0): void {
+  if (!t || typeof t !== "object" || depth > 80) return;
+  if (Array.isArray(t)) { for (const x of t) walkOcc(x, out, depth + 1); return; }
+  if (typeof t === "function") return;
+  if ((t.$ === "Ref" || t.$ === "Var" || t.$ === "PVar" || t.$ === "PCtr" || t.$ === "Hol")
+    && t.s && t.s.end > t.s.beg) {
+    const a = posOf(t.s.src, t.s.beg), b = posOf(t.s.src, t.s.end);
+    out.push({ k: t.k, kind: t.$, line: a.line, c0: a.character, c1: b.character });
+  }
+  for (const v of Object.values(t)) if (typeof v === "object") walkOcc(v, out, depth + 1);
+}
+
+// (the direct approach): occurrences with their src, grouped per file
+function occurrencesByFile(book: any, files: Map<string, FileMeta>): Map<string, Occ[]> {
+  const srcToFile = new Map<string, string>();
+  for (const [p, meta] of files) srcToFile.set(meta.stripped, p);
+  const out = new Map<string, Occ[]>();
+  const emit = (k: string, kind: string, src: string, beg: number, end: number): void => {
+    const p = srcToFile.get(src);
+    if (p === undefined) return;
+    const a = posOf(src, beg), b = posOf(src, end);
+    const arr = out.get(p) ?? [];
+    arr.push({ k, kind, line: a.line, c0: a.character, c1: b.character });
+    out.set(p, arr);
+  };
+  const walk = (t: any, depth = 0): void => {
+    if (!t || typeof t !== "object" || depth > 80) return;
+    if (Array.isArray(t)) { for (const x of t) walk(x, depth + 1); return; }
+    if (typeof t === "function") return;
+    if ((t.$ === "Ref" || t.$ === "Var" || t.$ === "PVar" || t.$ === "PCtr" || t.$ === "Hol")
+      && t.s && t.s.end > t.s.beg) emit(t.k, t.$, t.s.src, t.s.beg, t.s.end);
+    for (const v of Object.values(t)) if (typeof v === "object") walk(v, depth + 1);
+  };
+  for (const tld of Object.values<any>(book.tlds)) {
+    if (tld.b === true) continue;
+    if (tld.$ === "Def") { if (tld.T) walk(tld.T); if (tld.v) walk(tld.v); if (tld.e) walk(tld.e); }
+    if (tld.$ === "ADT") { walk(tld.T); for (const c of tld.c) walk(c.T); }
+  }
+  return out;
+}
+
 // ---- documents -----------------------------------------------------------
 
 type Doc = { text: string; version: number; timer: any; running: boolean;
@@ -83,9 +197,7 @@ type Doc = { text: string; version: number; timer: any; running: boolean;
 
 const docs = new Map<string, Doc>();
 
-function docOf(uri: string): Doc | undefined {
-  return docs.get(uri);
-}
+function docOf(uri: string): Doc | undefined { return docs.get(uri); }
 
 function schedule(uri: string, delay: number): void {
   const doc = docOf(uri);
@@ -94,9 +206,6 @@ function schedule(uri: string, delay: number): void {
   doc.timer = setTimeout(() => { doc.timer = null; void check(uri); }, delay);
 }
 
-// materialize the buffer on disk so the real checker (which reads files)
-// sees exactly the editor's text; relative imports keep working because the
-// shadow file sits beside the real one.
 function materialize(uri: string, text: string): { file: string; shadow: string | null } {
   let file: string | null = null;
   try {
@@ -140,10 +249,17 @@ async function check(uri: string): Promise<void> {
     const diagnostics: any[] = [];
     let status = { errors: 0, todos: 0, unsafe: 0, ok: true };
     const book = Bend.book_nil();
+    let loaded = false;
     try {
       await Bend.book_load(book, file, "", new Map());
+      loaded = true;
+      // cache occurrences BEFORE validation (checked terms hide subterms)
+      const entryText = shadow ? text : null;
+      const files = importGraph(file, entryText);
+      caches.set(uri, { book, files, occ: occurrencesByFile(book, files) });
       Bend.book_valid(book, 0);
     } catch (e: any) {
+      if (loaded) caches.set(uri, { book, files: importGraph(file, shadow ? text : null), occ: new Map() });
       status = { ...status, errors: 1, ok: false };
       const err = e;
       const todoM = /^Error: (\d+) TODOs?/.exec(String(e));
@@ -175,13 +291,11 @@ async function check(uri: string): Promise<void> {
         diagnostics.push({ range: rangeOf(undefined), severity: 3, source: "bend",
           message: n + " open claim" + (n === 1 ? "" : "s") + " (holes) — laws stated, not yet proven." });
       } else {
-        diagnostics.push({ range: rangeOf(undefined), severity: 1, source: "bend",
-          message: String(e) });
+        diagnostics.push({ range: rangeOf(undefined), severity: 1, source: "bend", message: String(e) });
       }
       report(uri, version, diagnostics, status);
       return;
     }
-    // check passed: holes and unsafe terms are workflow states, not errors
     const todos = (book.hols ?? 0) + (book.open ?? 0);
     if (todos > 0) {
       status = { errors: 0, todos, unsafe: 0, ok: true };
@@ -204,6 +318,229 @@ async function check(uri: string): Promise<void> {
     if (doc.pending && doc.version !== version) void check(uri);
     else doc.pending = false;
   }
+}
+
+// mirror of bend.ts's namespace join: posix.join normalizes './' away
+function nsJoin(ns: string, rel: string): string {
+  return path.posix.join(path.posix.dirname(ns === "" ? "." : ns), rel).replace(/\.bend$/, "");
+}
+
+// import graph with namespaces, mirroring bend.ts's own resolution
+function importGraph(entryPath: string, entryText: string | null): Map<string, FileMeta> {
+  const files = new Map<string, FileMeta>();
+  const nsOf = (ns: string, rel: string): string =>
+    path.posix.join(path.posix.dirname(ns === "" ? "." : ns), rel).replace(/\.bend$/, "");
+  const visit = (p: string, ns: string): void => {
+    const real = fs.realpathSync(p);
+    if (files.has(real)) return;
+    const isEntry = real === fs.realpathSync(entryPath);
+    const text = isEntry && entryText !== null ? entryText : fs.readFileSync(real, "utf8");
+    files.set(real, { path: real, ns, aliases: {}, text, stripped: stripImports(text), decls: [] });
+    for (const im of readImports(text)) {
+      if (im.rel === "Base" || im.rel.startsWith("0x")) continue;
+      if (!im.alias) continue;
+      visit(path.resolve(path.dirname(p), im.rel), nsOf(ns, im.rel));
+    }
+  };
+  try { visit(entryPath, ""); } catch { /* partial graph is fine */ }
+  for (const meta of files.values()) {
+    meta.aliases = aliasesOf(meta, files);
+    meta.decls = scanDecls(meta.text, meta.ns, meta.aliases);
+  }
+  return files;
+}
+
+function aliasesOf(meta: FileMeta, _files: Map<string, FileMeta>): Record<string, string> {
+  const al: Record<string, string> = {};
+  for (const im of readImports(meta.text)) {
+    if (im.alias) al[im.alias] = nsJoin(meta.ns, im.rel);
+  }
+  return al;
+}
+
+// ---- Phase 2: features over the cached Book ------------------------------
+
+function cacheOf(uri: string): Cache | undefined {
+  return caches.get(uri) ?? [...caches.entries()].find(([, c]) => c.files.has(uriFile(uri)))?.[1];
+}
+
+function uriFile(uri: string): string | null {
+  try { return uri.startsWith("file:") ? fs.realpathSync(fileURLToPath(uri)) : null; }
+  catch { return null; }
+}
+
+// resolve the word at a position to a Book key
+function keyAt(uri: string, line: number, ch: number): { key: string; occ: Occ; meta: FileMeta } | null {
+  const cache = cacheOf(uri);
+  if (!cache) return null;
+  const file = uriFile(uri);
+  if (!file) return null;
+  const meta = cache.files.get(file);
+  const occs = cache.occ.get(file) ?? [];
+  const occ = occs.find((o) => o.line === line && ch >= o.c0 && ch <= o.c1);
+  if (occ && meta) return { key: occ.k, occ, meta };
+  // fall back: decl site?
+  if (meta) {
+    for (const d of meta.decls) {
+      if (d.key && d.line === line && ch >= d.c0 && ch <= d.c1) return { key: d.key, occ: { k: d.key, kind: "decl", line, c0: d.c0, c1: d.c1 }, meta };
+    }
+  }
+  return null;
+}
+
+function declSitesOfKey(key: string): { uri: string; range: any; kind: string }[] {
+  const out: { uri: string; range: any; kind: string }[] = [];
+  for (const [, cache] of caches) {
+    for (const [p, meta] of cache.files) {
+      for (const d of meta.decls) {
+        if (d.key === key) {
+          out.push({ uri: pathToFileURL(p).href, kind: d.kind,
+            range: { start: { line: d.line, character: d.c0 }, end: { line: d.line, character: d.c1 } } });
+        }
+      }
+    }
+  }
+  return out;
+}
+
+// a def that fills a law shares its key: jumping to the law reads better
+function declSiteOfKey(key: string): { uri: string; range: any } | null {
+  const sites = declSitesOfKey(key);
+  return sites.find((s) => s.kind === "law") ?? sites[0] ?? null;
+}
+
+function hoverOf(key: string, book: any): string | null {
+  const tld = book.tlds[key];
+  const ctr = book.ctrs[key];
+  if (tld) {
+    const kind = tld.$ === "ADT" ? "type" : "def";
+    const t = safeShow(() => Bend.term_show(Bend.term_lower(tld.T), -1, []));
+    const base = tld.b === true ? " — Base" : "";
+    const law = tld.$ === "Def" && tld.v === null ? " (open law)" : "";
+    return "```bend\n" + kind + " " + key + base + law + "\n  :: " + t + "\n```";
+  }
+  if (ctr) {
+    const t = safeShow(() => Bend.term_show(Bend.term_lower(ctr.T), -1, []));
+    return "```bend\nconstructor " + key + " (arity " + ctr.n + ")\n  :: " + t + "\n```";
+  }
+  return null;
+}
+
+// names reachable from a file, in user-facing form
+function completionsIn(meta: FileMeta, book: any): any[] {
+  const out: any[] = [];
+  const seen = new Set<string>();
+  for (const key of Object.keys(book.tlds)) {
+    let shown: string | null = null;
+    if (meta.ns !== "" && key.startsWith(meta.ns + ".")) {
+      shown = key.slice(meta.ns.length + 1); // names of this file's own module
+    } else {
+      for (const [alias, target] of Object.entries(meta.aliases)) {
+        if (key.startsWith(target + ".")) { shown = alias + key.slice(target.length); break; }
+      }
+    }
+    if (shown === null && !key.includes("/")) shown = key; // global / Base name as written
+    if (!shown || seen.has(shown)) continue;
+    seen.add(shown);
+    const tld = book.tlds[key];
+    const isLaw = tld.$ === "Def" && tld.v === null;
+    out.push({ label: shown,
+      kind: tld.$ === "ADT" ? 23 /* Struct */ : 3 /* Function */,
+      detail: (tld.b === true ? "Base · " : "") + (isLaw ? "law" : "def") + " :: "
+        + safeShow(() => Bend.term_show(Bend.term_lower(tld.T), -1, []).slice(0, 160)) });
+  }
+  for (const key of Object.keys(book.ctrs)) {
+    if (!seen.has(key)) {
+      seen.add(key);
+      const c = book.ctrs[key];
+      out.push({ label: key, kind: 20 /* EnumMember */, detail: "constructor, arity " + c.n });
+    }
+  }
+  return out;
+}
+
+const KEYWORDS = ["def", "law", "type", "match", "case", "do", "return", "import",
+  "as", "for", "exs", "where", "is", "Type", "Data", "Kind", "Quant", "@unsafe"];
+
+const SNIPPETS = [
+  { label: "def", insert: "def ${1:name}(${2:x: T}) -> ${3:U32}:\n  $0" },
+  { label: "law", insert: "law ${1:name}:\n  for ${2:x}: ${3:T}\n  ${4:claim}" },
+  { label: "type", insert: "type ${1:Name} is Data:\n  ${2:K}{x: ${3:T}}" },
+  { label: "match", insert: "match ${1:x}:\n  case ${2:K}:\n    $0" },
+  { label: "do", insert: "do ${1:IO}<${2:Unit}>:\n  $0" },
+];
+
+// ---- semantic tokens ------------------------------------------------------
+
+const TOKEN_TYPES = ["function", "law", "type", "constructor", "variable",
+  "parameter", "hole", "module", "keyword"];
+
+function semanticTokensOf(uri: string): { data: number[] } | null {
+  const cache = cacheOf(uri);
+  const file = uriFile(uri);
+  if (!cache || !file) return null;
+  const meta = cache.files.get(file);
+  const occs = cache.occ.get(file) ?? [];
+  if (!meta) return null;
+  const book = cache.book;
+  const toks: { line: number; c0: number; len: number; t: number }[] = [];
+  const push = (line: number, c0: number, len: number, t: number) => {
+    if (len > 0) toks.push({ line, c0, len, t });
+  };
+  for (const d of meta.decls) {
+    if (d.kind === "import") push(d.line, d.c0, d.c1 - d.c0, 7);
+    else if (d.kind === "type") push(d.line, d.c0, d.c1 - d.c0, 2);
+    else {
+      const tld = d.key ? book.tlds[d.key] : undefined;
+      const isLaw = tld && tld.$ === "Def" && tld.v === null;
+      push(d.line, d.c0, d.c1 - d.c0, isLaw ? 1 : 0);
+    }
+  }
+  for (const o of occs) {
+    const t = o.kind === "PCtr" || (o.kind === "Ref" && book.ctrs[o.k] !== undefined) ? 3
+      : o.kind === "Var" ? 4 : o.kind === "PVar" ? 5
+      : o.kind === "Hol" ? 6 : o.kind === "Ref" ? 0 : 4;
+    push(o.line, o.c0, o.c1 - o.c0, t);
+  }
+  toks.sort((a, b) => (a.line - b.line) || (a.c0 - b.c0));
+  const data: number[] = [];
+  let pl = 0, pc = 0;
+  for (const t of toks) {
+    data.push(t.line - pl, t.c0 - (t.line === pl ? pc : 0), t.len, t.t, 0);
+    pl = t.line; pc = t.c0;
+  }
+  return { data };
+}
+
+// ---- folding (indentation blocks — Bend is layout-scoped) ----------------
+
+function foldingOf(uri: string): any[] | null {
+  const doc = docOf(uri);
+  const cache = cacheOf(uri);
+  if (!doc || !cache) return null;
+  const file = uriFile(uri);
+  const meta = file ? cache.files.get(file) : undefined;
+  const text = meta ? meta.text : doc.text;
+  const lines = text.split("\n");
+  const out: any[] = [];
+  const stack: { line: number; ind: number }[] = [];
+  let lastNonBlank = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    if (!l.trim()) continue;
+    const ind = l.length - l.trimStart().length;
+    while (stack.length && stack[stack.length - 1].ind >= ind) {
+      const s = stack.pop()!;
+      if (i - 1 > s.line) out.push({ startLine: s.line, endLine: i - 1, kind: "region" });
+    }
+    stack.push({ line: i, ind });
+    lastNonBlank = i;
+  }
+  while (stack.length) {
+    const s = stack.pop()!;
+    if (lastNonBlank > s.line) out.push({ startLine: s.line, endLine: lastNonBlank, kind: "region" });
+  }
+  return out;
 }
 
 // ---- LSP plumbing --------------------------------------------------------
@@ -231,6 +568,7 @@ peer.notificationHandler = (method: string, params: any) => {
     case "textDocument/didSave": schedule(params.textDocument.uri, 0); return;
     case "textDocument/didClose":
       docs.delete(params.textDocument.uri);
+      caches.delete(params.textDocument.uri);
       peer.notify("textDocument/publishDiagnostics", { uri: params.textDocument.uri, diagnostics: [] });
       return;
     case "exit": process.exit(0); return;
@@ -245,9 +583,145 @@ peer.requestHandler = async (method: string, params: any) => {
         "bend-lsp: checker " + (BEND_TS ? BEND_TS : "NOT FOUND") });
       return { capabilities: {
         textDocumentSync: { openClose: true, change: 1, save: true },
+        completionProvider: { triggerCharacters: ["."], resolveProvider: false },
+        hoverProvider: true,
+        definitionProvider: true,
+        referencesProvider: true,
+        documentSymbolProvider: true,
+        workspaceSymbolProvider: true,
+        renameProvider: { prepareProvider: true },
+        foldingRangeProvider: true,
+        semanticTokensProvider: {
+          legend: { tokenTypes: TOKEN_TYPES, tokenModifiers: [] },
+          full: true,
+        },
       }, serverInfo: { name: "bend-lsp" } };
     case "shutdown": return null;
     case "bend/checkNow": schedule(params.uri, 0); return null;
+    case "textDocument/completion": {
+      const uri = params.textDocument.uri;
+      const cache = cacheOf(uri);
+      const file = uriFile(uri);
+      if (!cache || !file) return KEYWORDS.map((k) => ({ label: k, kind: 14 }))
+        .concat(SNIPPETS.map((s) => ({ label: s.label, kind: 15, insert: s.insert })));
+      const meta = cache.files.get(file)!;
+      const pos = params.position;
+      const line = docOf(uri)?.text.split("\n")[pos.line] ?? "";
+      const dotPrefix = /^([A-Za-z_][\w]*)\.\w*$/.exec(line.slice(0, pos.character));
+      let items = completionsIn(meta, cache.book);
+      if (dotPrefix) {
+        const prefix = dotPrefix[1] + ".";
+        items = items.filter((i: any) => i.label.startsWith(prefix));
+      }
+      return items.concat(KEYWORDS.map((k) => ({ label: k, kind: 14 })))
+        .concat(SNIPPETS.map((s) => ({ label: s.label, kind: 15, insert: s.insert })));
+    }
+    case "textDocument/hover": {
+      const at = keyAt(params.textDocument.uri, params.position.line, params.position.character);
+      if (!at) return null;
+      const cache = cacheOf(params.textDocument.uri)!;
+      const h = hoverOf(at.key, cache.book);
+      return h ? { contents: { kind: "markdown", value: h } } : null;
+    }
+    case "textDocument/definition": {
+      const at = keyAt(params.textDocument.uri, params.position.line, params.position.character);
+      if (!at) return null;
+      const site = declSiteOfKey(at.key);
+      return site ? [site] : null;
+    }
+    case "textDocument/references": {
+      const at = keyAt(params.textDocument.uri, params.position.line, params.position.character);
+      if (!at) return null;
+      const out: any[] = [];
+      for (const [uri, cache] of caches) {
+        void uri;
+        for (const [p, occs] of cache.occ) {
+          for (const o of occs) {
+            if (o.k === at.key) out.push({ uri: pathToFileURL(p).href,
+              range: { start: { line: o.line, character: o.c0 }, end: { line: o.line, character: o.c1 } } });
+          }
+        }
+      }
+      if (params.context && params.context.includeDeclaration) {
+        for (const s of declSitesOfKey(at.key)) out.push(s);
+      }
+      return out;
+    }
+    case "textDocument/prepareRename": {
+      const at = keyAt(params.textDocument.uri, params.position.line, params.position.character);
+      if (!at) return null;
+      // locals (de Bruijn) need scope analysis; only top-level names for now
+      if (at.occ.kind === "Var" || at.occ.kind === "PVar") return null;
+      const cache = cacheOf(params.textDocument.uri)!;
+      if (!cache.book.tlds[at.key] && !cache.book.ctrs[at.key]) return null;
+      return { range: { start: { line: at.occ.line, character: at.occ.c0 },
+        end: { line: at.occ.line, character: at.occ.c1 } }, placeholder: at.key };
+    }
+    case "textDocument/rename": {
+      const at = keyAt(params.textDocument.uri, params.position.line, params.position.character);
+      if (!at) return null;
+      const newName: string = params.newName;
+      const changes: Record<string, any[]> = {};
+      const add = (uri: string, line: number, c0: number, c1: number) => {
+        (changes[uri] = changes[uri] ?? []).push(
+          { range: { start: { line, character: c0 }, end: { line, character: c1 } }, newText: newName });
+      };
+      let count = 0;
+      for (const [, cache] of caches) {
+        for (const [p, occs] of cache.occ) {
+          for (const o of occs) {
+            if (o.k === at.key && o.kind !== "Var" && o.kind !== "PVar") {
+              add(pathToFileURL(p).href, o.line, o.c0, o.c1);
+              count++;
+            }
+          }
+        }
+        for (const [p, meta] of cache.files) {
+          for (const d of meta.decls) {
+            if (d.key === at.key) {
+              add(pathToFileURL(p).href, d.line, d.c0, d.c1);
+              count++;
+            }
+          }
+        }
+      }
+      return count > 0 ? { changes } : null;
+    }
+    case "textDocument/documentSymbol": {
+      const cache = cacheOf(params.textDocument.uri);
+      const file = uriFile(params.textDocument.uri);
+      if (!cache || !file) return [];
+      const meta = cache.files.get(file);
+      if (!meta) return [];
+      return meta.decls.map((d) => ({
+        name: d.name,
+        kind: d.kind === "type" ? 23 : d.kind === "import" ? 2 : (cache.book.tlds[d.key!]?.$ === "Def"
+          && cache.book.tlds[d.key!].v === null ? 12 : 12),
+        location: { uri: params.textDocument.uri,
+          range: { start: { line: d.line, character: d.c0 }, end: { line: d.line, character: d.c1 } } },
+      }));
+    }
+    case "workspace/symbol": {
+      const q: string = (params.query || "").toLowerCase();
+      const out: any[] = [];
+      for (const [uri, cache] of caches) {
+        void uri;
+        for (const [p, meta] of cache.files) {
+          for (const d of meta.decls) {
+            if (d.kind === "import") continue;
+            if (q && !d.name.toLowerCase().includes(q)) continue;
+            out.push({ name: d.name, kind: d.kind === "type" ? 23 : 12,
+              location: { uri: pathToFileURL(p).href,
+                range: { start: { line: d.line, character: d.c0 }, end: { line: d.line, character: d.c1 } } } });
+          }
+        }
+      }
+      return out;
+    }
+    case "textDocument/foldingRange":
+      return foldingOf(params.textDocument.uri);
+    case "textDocument/semanticTokens/full":
+      return semanticTokensOf(params.textDocument.uri);
     default: throw new Error("MethodNotFound: " + method);
   }
 };
