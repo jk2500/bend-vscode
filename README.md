@@ -1,35 +1,54 @@
-# Bend (2.0) Syntax for VS Code
+# Bend (2.0) for VS Code — Language Server
 
-Syntax highlighting for [Bend 2.0](https://bend-lang.com) — the parallel language with built-in proofs.
+Language support for [Bend 2.0](https://bend-lang.com) — the parallel language with built-in proofs — powered by **the real Bend checker**.
 
-Faithfully ported from the official `bend2/docs/bend.sublime-syntax` in the [HigherOrderCO/Bend](https://github.com/HigherOrderCO/Bend) repository, extended for the law/proof workflow.
+## How it works
+
+`server/server.ts` is a zero-dependency LSP server that imports the actual
+toolchain (`~/.bend/current/bend2/bend.ts` — the same code the `bend` CLI
+runs) and reports its structured results. Nothing about the language is
+reimplemented: parse, types, laws, holes and locations all come from Bend
+itself. The extension only spawns it with `bun` and maps results to squiggles.
+
+If `bun` or the toolchain is missing, the extension falls back to v1-style
+CLI-text checking.
 
 ## Features
 
-### Live checking (v1.1)
-- Runs the real Bend checker (`bend`) when you open or save a `.bend` file
-- Errors get red squiggles with the checker's own `expected / observed` message and location
-- Open laws show as an information marker: "N open claims (TODO)" - a workflow state, not an error
-- Status bar shows the file's state: All terms check / errors / open claims
-- Command: "Bend: check this file now"
-- Uses `-o <tmp>.c` so `main` never executes during checking; 15s timeout; no network
+- **Exact diagnostics as you type** (300 ms debounce): the checker's
+  `expected / observed` message with the def name and local bindings, with a
+  squiggle on the exact character range — not the whole line
+- **Workflow states, not errors**: open claims (`?holes`) show as an
+  information marker — "laws stated, not yet proven"; `@unsafe` terms show a
+  warning
+- **Checks in-memory buffers**: unsaved edits are checked through a shadow
+  file beside the real one, so relative imports keep working; the file on
+  disk is checked directly when clean
+- **Per-file status bar**: All terms check / N errors / N open claims / unsafe
+- **Commands**: `Bend: check this file now`, `Bend: restart language server`
+- **Editor-agnostic**: any LSP client can run `bun server/server.ts`
+- Syntax highlighting ported from the official `bend.sublime-syntax`, with
+  `law`/`{==}`/hole support, and language configuration
 
-- All Bend 2.0 keywords: `def`, `law`, `type`, `match`, `case`, `import`, `for`, `exs`, `where`, `do`, `is`, `@unsafe`
-- Law and proof support: `law`/`def` names highlighted, `{==}` proof token gets its own color, holes (`?name`) distinct
-- `Nat` literals (`3n`), use-counts (`&0`/`&1`/`&2`), numbers, strings, char literals
-- Capitalized type names (`U32`, `Nat`, `Bool`, `IO`, constructors) in type color
-- `#` comments, full operator set (`->`, `=>`, `<-`, `<&>`, `++`, `<>`, …)
-- Language configuration: comment toggling, bracket matching/auto-closing, colon-based indentation
+## Requirements
 
-## Why this exists
+- The [Bend](https://bend-lang.com) toolchain (`~/.bend`)
+- [bun](https://bun.sh) (bundled with the Bend installer's default setup)
 
-Every VS Code extension currently on the marketplace predates Bend 2.0 and cannot highlight
-`law`, `exs`, or `import`. The official repo ships a Sublime syntax but no VS Code extension.
-This port closes that gap. Source of truth: the official Sublime syntax file.
+## Settings
 
-## Install
+- `bend2.server.enabled` — use the language server (default `true`); off = CLI-text fallback
 
-Search "Bend 2.0" in the VS Code extension marketplace, or install the `.vsix` manually:
-`code --install-extension bend2-1.0.0.vsix`
+## Development
+
+```bash
+code --install-extension bend2-2.0.0.vsix   # or launch the folder as an extension host
+```
+
+The server speaks plain LSP over stdio; to try it standalone:
+
+```bash
+bun server/server.ts   # then speak JSON-RPC on stdin/stdout
+```
 
 MIT licensed. Bend is by HigherOrderCO; this extension is community-maintained.

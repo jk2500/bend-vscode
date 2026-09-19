@@ -1,8 +1,8 @@
 {
   "name": "bend2",
-  "displayName": "Bend (2.0) Syntax",
-  "description": "Syntax highlighting for Bend 2.0 - the parallel proof language (bend-lang.com). Ported from the official bend.sublime-syntax, with law/proof support.",
-  "version": "1.1.0",
+  "displayName": "Bend (2.0) \u2014 Language Server",
+  "description": "Bend 2.0 language support powered by the real Bend checker: exact diagnostics, law/proof workflow states. LSP server + syntax.",
+  "version": "2.0.0",
   "publisher": "jk2500",
   "license": "MIT",
   "icon": "icon.png",
@@ -19,7 +19,9 @@
     "higherorderco",
     "laws",
     "proofs",
-    "parallel"
+    "parallel",
+    "lsp",
+    "language server"
   ],
   "repository": {
     "type": "git",
@@ -49,8 +51,22 @@
       {
         "command": "bend2.check",
         "title": "Bend: check this file now"
+      },
+      {
+        "command": "bend2.restartServer",
+        "title": "Bend: restart language server"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "Bend",
+      "properties": {
+        "bend2.server.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Use the language server (bun + the real Bend checker). Off = CLI-text fallback."
+        }
+      }
+    }
   },
   "main": "./src/extension.js",
   "activationEvents": [
