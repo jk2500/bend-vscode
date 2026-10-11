@@ -85,7 +85,8 @@ CLI-text checking.
 ## Development
 
 ```bash
-code --install-extension bend2-2.0.0.vsix   # or launch the folder as an extension host
+# download bend2-2.3.1.vsix from https://github.com/jk2500/bend-vscode/releases
+code --install-extension bend2-2.3.1.vsix   # or launch the folder as an extension host
 ```
 
 The server speaks plain LSP over stdio; to try it standalone:
@@ -94,4 +95,4 @@ The server speaks plain LSP over stdio; to try it standalone:
 bun server/server.ts   # then speak JSON-RPC on stdin/stdout
 ```
 
-MIT licensed. Bend is by HigherOrderCO; this extension is community-maintained.
+MIT licensed. The vendored Bend checker in `server/deps/bend2/` is Apache-2.0 (see `server/deps/SOURCES.md`). Bend is by HigherOrderCO; this extension is community-maintained.
